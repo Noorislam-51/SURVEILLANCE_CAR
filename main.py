@@ -1,20 +1,51 @@
 """
 ==============================================================================
  AI Surveillance Car — Real-Time Object + Traffic Light Command HUD
- Target: VS Code / local Python, output served ONLY via web dashboard
+ Target: local Python, output served via web dashboard
  Pipeline: YOLOv8n detection -> HSV traffic-light colour classification
            -> priority-based driving command -> HUD overlay -> MJPEG stream
+
+ PERFORMANCE NOTES (read before tuning further):
+ - Capture and inference now run on SEPARATE threads. cap.read() never blocks
+   waiting for YOLO, and YOLO never blocks waiting for the camera. This alone
+   fixes most of the "video feels laggy/stuttery" complaint, because a slow
+   video source no longer stalls the whole pipeline and vice versa.
+ - Inference does NOT run on every captured frame (see FRAME_SKIP). Between
+   inference frames we redraw the last known HUD/boxes onto the freshest raw
+   frame, so the stream still looks live even though detection itself runs
+   at a lower rate than capture.
+ - imgsz=320 cuts YOLO inference time roughly in half vs default 640, with a
+   real accuracy tradeoff on small/far objects. If your demo needs to detect
+   small traffic lights at distance, bump this back up and accept fewer FPS.
+ - This is still a CPU compute ceiling problem if you don't have CUDA. Check
+   torch.cuda.is_available() below at startup — it's printed on launch.
 ==============================================================================
 """
 
 import threading
+import time
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 from flask import Flask, Response
 
-# Initialize your model
+# ── Device check — tells you immediately whether you even have a chance
+# at real smoothness, instead of you guessing after the fact ──────────
+DEVICE = 0 if torch.cuda.is_available() else "cpu"
+print(f"[startup] torch.cuda.is_available() = {torch.cuda.is_available()} -> using device={DEVICE}")
+if DEVICE == "cpu":
+    print("[startup] WARNING: running YOLO on CPU. Frame-skipping and imgsz=320 "
+          "will help, but expect a hard ceiling around 10-15 FPS on typical "
+          "laptop/Pi hardware. This is a compute limit, not a code bug.")
+
 model = YOLO("yolov8n.pt")
+
+# ── Tuning knobs ───────────────────────────────────────────────────
+INFER_IMGSZ = 320       # lower = faster inference, worse small-object accuracy
+FRAME_SKIP = 2          # run YOLO every Nth captured frame (1 = every frame)
+STREAM_FPS_CAP = 20     # max frames/sec sent to the browser
+JPEG_QUALITY = 75        # lower = faster encode + less bandwidth, more artifacts
 
 # ── HSV colour ranges for traffic light signals ──────────────────
 TL_COLOR_RANGES = {
@@ -142,11 +173,65 @@ def draw_hud(frame, cmd, col, names, tl_colors):
     return frame
 
 
-# ── Shared state between the capture thread and the Flask server ──
-# latest_frame holds the most recent ANNOTATED (boxes + HUD drawn) frame.
-# A lock guards it since two threads touch it: the capture loop writes,
-# the Flask generator reads. Without the lock you can read a half-written
-# frame and get visual tearing/corruption in the stream.
+def run_detection(frame):
+    """One inference pass at reduced resolution. Returns raw detection DATA
+    only — no drawing here. Drawing is separated out into draw_boxes() so
+    the caller can re-apply the same box list to every subsequent frame
+    until the next inference pass, instead of boxes only existing on the
+    exact frame where YOLO happened to run (that was the flicker bug —
+    boxes were popping in/out every other frame instead of persisting)."""
+    results = model(frame, imgsz=INFER_IMGSZ, device=DEVICE, verbose=False)
+    names, tl_colors, box_list = [], [], []
+
+    for box in results[0].boxes:
+        conf = float(box.conf[0])
+        if conf < CONF_THRESHOLD:
+            continue
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        cls_name = model.names[int(box.cls[0])].lower()
+        names.append(cls_name)
+
+        if cls_name == "traffic light":
+            tl_color = detect_tl_color(frame, x1, y1, x2, y2)
+            tl_colors.append(tl_color)
+            box_col = {"red": (0, 0, 255), "yellow": (0, 220, 255),
+                       "green": (0, 255, 60), "unknown": (128, 128, 128)}[tl_color]
+            box_list.append({
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "color": box_col, "label": f"TL:{tl_color} {conf:.0%}", "thickness": 3,
+            })
+        else:
+            box_list.append({
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "color": (0, 255, 0), "label": f"{cls_name} {conf:.0%}", "thickness": 2,
+            })
+
+    cmd, col = get_command(results, frame)
+    return cmd, col, names, tl_colors, box_list
+
+
+def draw_boxes(frame, box_list):
+    """Redraws a cached box list onto ANY frame. Called every loop
+    iteration — inference frames and skipped frames alike — so boxes stay
+    visibly present and just update in position every FRAME_SKIP frames,
+    instead of blinking on/off."""
+    for b in box_list:
+        cv2.rectangle(frame, (b["x1"], b["y1"]), (b["x2"], b["y2"]), b["color"], b["thickness"])
+        cv2.putText(frame, b["label"], (b["x1"], max(b["y1"] - 6, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, b["color"], 1)
+    return frame
+
+
+# ── Shared state ────────────────────────────────────────────────────
+# raw_frame: latest frame straight from the camera, no processing.
+# latest_frame: latest ANNOTATED frame actually sent to the browser.
+# Two separate locks because the capture thread and inference thread
+# write to different things at different rates — sharing one lock would
+# make the fast capture thread wait on the slow inference thread for no
+# reason.
+raw_frame = None
+raw_lock = threading.Lock()
+
 latest_frame = None
 frame_lock = threading.Lock()
 
@@ -155,12 +240,15 @@ frame_lock = threading.Lock()
 #   "http://<esp32-ip>:81/stream"  -> ESP32-CAM / IP camera MJPEG stream
 VIDEO_SOURCE = 0
 
+stop_event = threading.Event()
+
 
 def capture_loop():
-    """Runs forever in a background thread: grab frame, detect, annotate,
-    store into latest_frame. No cv2.imshow — display happens only in the
-    browser dashboard via the /video_feed route below."""
-    global latest_frame
+    """ONLY grabs frames as fast as the camera can deliver them. Never
+    touches YOLO. This is what was blocking your video before — capture
+    and inference used to be the same loop, so a slow model made the
+    camera read look slow too, even though the camera itself was fine."""
+    global raw_frame
 
     cap = cv2.VideoCapture(VIDEO_SOURCE)
     if not cap.isOpened():
@@ -170,66 +258,93 @@ def capture_loop():
             "If using a local webcam on Windows and it still fails, try "
             "cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_DSHOW)."
         )
+    # Ask the camera for a smaller frame directly, if it supports it.
+    # Cheaper than capturing large and downscaling in software.
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # avoid queued stale frames
 
     print("Capture thread started.")
 
     try:
-        while cap.isOpened():
+        while not stop_event.is_set() and cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 print("Failed to grab frame or stream ended.")
                 break
-
-            results = model(frame, verbose=False)
-            names, tl_colors = [], []
-
-            for box in results[0].boxes:
-                conf = float(box.conf[0])
-                if conf < CONF_THRESHOLD:
-                    continue
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cls_name = model.names[int(box.cls[0])].lower()
-                names.append(cls_name)
-
-                if cls_name == "traffic light":
-                    tl_color = detect_tl_color(frame, x1, y1, x2, y2)
-                    tl_colors.append(tl_color)
-                    box_col = {"red": (0, 0, 255), "yellow": (0, 220, 255),
-                               "green": (0, 255, 60), "unknown": (128, 128, 128)}[tl_color]
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), box_col, 3)
-                    cv2.putText(frame, f"TL:{tl_color} {conf:.0%}",
-                                (x1, max(y1 - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.55, box_col, 1)
-                else:
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(frame, f"{cls_name} {conf:.0%}",
-                                (x1, max(y1 - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5, (0, 255, 0), 1)
-
-            cmd, col = get_command(results, frame)
-            frame = draw_hud(frame, cmd, col, names, tl_colors)
-
-            with frame_lock:
-                latest_frame = frame
-
+            with raw_lock:
+                raw_frame = frame
     finally:
         cap.release()
         print("Capture thread stopped.")
 
 
-# ── Flask MJPEG server (this is what the dashboard HTML points at) ─
+def inference_loop():
+    """Runs YOLO on the freshest available raw frame, skipping frames as
+    configured. Between inference passes, redraws the last known HUD onto
+    fresh raw frames so the stream keeps moving at full capture rate even
+    though detection itself is slower."""
+    global latest_frame
+
+    frame_count = 0
+    last_cmd, last_col = "GO", (0, 200, 80)
+    last_names, last_tl_colors, last_boxes = [], [], []
+
+    while not stop_event.is_set():
+        with raw_lock:
+            frame = None if raw_frame is None else raw_frame.copy()
+        if frame is None:
+            time.sleep(0.01)
+            continue
+
+        frame_count += 1
+        if frame_count % FRAME_SKIP == 0:
+            last_cmd, last_col, last_names, last_tl_colors, last_boxes = run_detection(frame)
+
+        # Runs EVERY frame, whether or not inference ran this iteration.
+        # Boxes/HUD are drawn from the cached (last_*) values so they never
+        # disappear — they just update in position/label every FRAME_SKIP
+        # frames instead of every single frame.
+        frame = draw_boxes(frame, last_boxes)
+        frame = draw_hud(frame, last_cmd, last_col, last_names, last_tl_colors)
+        with frame_lock:
+            latest_frame = frame
+
+
+# ── Flask MJPEG server ─────────────────────────────────────────────
 app = Flask(__name__)
 
 
 def gen_frames():
+    """Rate-limited generator. Previously this busy-waited with a bare
+    `continue` whenever latest_frame was None, pegging a CPU core doing
+    nothing useful. Now it sleeps when idle and caps send rate so we're
+    not re-encoding/re-sending frames faster than the browser can render
+    or faster than the frame actually changes."""
+    last_sent_id = None
+    min_interval = 1.0 / STREAM_FPS_CAP
+
     while True:
+        loop_start = time.time()
+
         with frame_lock:
-            if latest_frame is None:
-                continue
-            ret, jpeg = cv2.imencode('.jpg', latest_frame)
+            frame = latest_frame
+
+        if frame is None or id(frame) == last_sent_id:
+            time.sleep(0.01)
+            continue
+
+        ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if not ret:
             continue
+
+        last_sent_id = id(frame)
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+
+        elapsed = time.time() - loop_start
+        sleep_left = min_interval - elapsed
+        if sleep_left > 0:
+            time.sleep(sleep_left)
 
 
 @app.route('/video_feed')
@@ -239,20 +354,17 @@ def video_feed():
 
 @app.route('/')
 def dashboard():
-    # Serves surveillance_dashboard.html directly, so hitting the bare
-    # host in a browser shows the dashboard instead of 404ing.
-    # Requires surveillance_dashboard.html to sit in the same folder as this script.
     with open('surveillance_dashboard.html', 'r', encoding='utf-8') as f:
         return f.read()
 
 
 if __name__ == '__main__':
-    # Capture/detection runs in the background; Flask owns the main thread
-    # so it can actually accept HTTP connections from the dashboard.
-    t = threading.Thread(target=capture_loop, daemon=True)
-    t.start()
+    t_capture = threading.Thread(target=capture_loop, daemon=True)
+    t_infer = threading.Thread(target=inference_loop, daemon=True)
+    t_capture.start()
+    t_infer.start()
 
-    # host='0.0.0.0' is required if the dashboard is opened from a different
-    # device than the one running this script (e.g. viewing from your phone
-    # while this runs on a laptop/Pi attached to the camera).
-    app.run(host='0.0.0.0', port=5000)
+    try:
+        app.run(host='0.0.0.0', port=5000, threaded=True)
+    finally:
+        stop_event.set()
